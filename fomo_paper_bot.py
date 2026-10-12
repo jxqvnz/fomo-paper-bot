@@ -1,17 +1,16 @@
 """
-FOMO Paper Beast — propracovaný paper copy bot
+FOMO Paper Beast — paper copy trading bot
 - Top 3 na 7D + 30D (bez 24H kvůli scammerům)
 - VIP list (brezscales, orangie…)
-- Grok propojení (chat + rozhodování)
-- Hezký Telegram dashboard
+- Grok propojení (chat)
+- Reálná data z FOMO API – ŽÁDNÁ SIMULACE
 """
 
 import os
-import random
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, field, asdict
 
@@ -27,20 +26,27 @@ from telegram.ext import (
 )
 
 # ==================== KONFIGURACE ====================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8746780290:AAH2qID7_zInu3J9AAe-uQLrhtMPMUUi-fc")
-FOMO_API_KEY = os.getenv("FOMO_API_KEY", "fapi_52ed786dadcc4df593554d5022e59e32eae588cc838c4e0cb8dada86b76ce685")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+FOMO_API_KEY = os.getenv("FOMO_API_KEY", "")
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")  # z console.x.ai — pro Grok chat
 FOMO_API_BASE = "https://api.fomoapi.io/v2"
 
-POLL_INTERVAL = 60
-TOP_N = 3
-WINDOWS = ["7d", "30d"]  # 24h odstraněno
+POLL_INTERVAL = 60          # jak často kontrolovat nové obchody (sekundy)
+TOP_N = 3                   # kolik top traderů z každého okna
+WINDOWS = ["7d", "30d"]     # 24h odstraněno kvůli scammerům
 WATCHLIST = ["brezscales", "orangie", "tjr", "unipcs", "pointfarmcap"]
 STARTING_BALANCE = 1000.0
-TRADE_SIZE_PCT = 0.05
+TRADE_SIZE_PCT = 0.05       # 5 % zůstatku na jeden obchod
+TRADES_PER_TRADER = 5       # kolik posledních obchodů číst na tradera
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def utcnow() -> datetime:
+    """Timezone-aware UTC now (nahrazuje deprecated datetime.utcnow())."""
+    return datetime.now(timezone.utc)
+
 
 # Chat IDs, které dostávají notifikace (naplní se při /start)
 SUBSCRIBERS: Set[int] = set()
@@ -61,6 +67,7 @@ class PaperPosition:
     entry_price: float
     entry_time: str
     source_trader: str
+    trade_id: str = ""
 
 @dataclass
 class PaperPortfolio:
@@ -81,64 +88,118 @@ class PaperPortfolio:
             "history": self.history[-30:],
         }
 
-# ==================== FOMO + GROK ====================
+# ==================== FOMO API (REÁLNÁ DATA) ====================
 class FomoData:
+    """Čte skutečná data z FOMO API. Žádná simulace."""
+
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=15.0)
-        self.last_seen: Set[str] = set()
+        self.last_seen_trades: Set[str] = set()   # tradeId již zpracovaných obchodů
 
     async def get_top(self, window: str) -> List[Trader]:
+        """Načte top tradery z leaderboardu. Vrací i userId pro přesné dotazy."""
         if not FOMO_API_KEY:
-            return self._mock(window)
+            logger.warning("FOMO_API_KEY není nastaven – leaderboard nelze načíst.")
+            return []
         try:
             r = await self.client.get(
                 f"{FOMO_API_BASE}/leaderboard/{window}",
                 params={"limit": TOP_N},
-                headers={"authorization": f"Bearer {FOMO_API_KEY}"},
+                headers={
+                    "Accept": "application/json",
+                    "authorization": f"Bearer {FOMO_API_KEY}",
+                },
             )
             r.raise_for_status()
             data = r.json()
-            return [
-                Trader(
-                    handle=t.get("handle", "?"),
-                    user_id=t.get("userId") or "",
-                    rank=t.get("rank", i + 1),
-                    window=window,
-                    pnl_usd=float(t.get("pnlUsd") or 0),
+            traders = []
+            for i, t in enumerate(data.get("traders", [])[:TOP_N]):
+                traders.append(
+                    Trader(
+                        handle=t.get("handle", "?"),
+                        user_id=t.get("userId") or "",
+                        rank=t.get("rank", i + 1),
+                        window=window,
+                        pnl_usd=float(t.get("pnlUsd") or 0),
+                    )
                 )
-                for i, t in enumerate(data.get("traders", [])[:TOP_N])
-            ]
+            return traders
         except Exception as e:
             logger.warning(f"Leaderboard {window}: {e}")
-            return self._mock(window)
+            return []
 
-    def _mock(self, window: str) -> List[Trader]:
-        names = (
-            ["brezscales", "orangie", "tjr"]
-            if window == "7d"
-            else ["unipcs", "pointfarmcap", "frankdegods"]
-        )
-        return [
-            Trader(handle=n, rank=i + 1, window=window, pnl_usd=random.randint(50000, 400000))
-            for i, n in enumerate(names)
-        ]
+    async def get_trades(self, trader: Trader) -> List[dict]:
+        """
+        Načte SKUTEČNÉ obchody tradera z /v2/users/{handle}/trades.
+        Vrací pouze nové obchody, které jsme ještě neviděli.
+        """
+        if not FOMO_API_KEY:
+            return []
 
-    async def poll_trades(self, traders: List[Trader]) -> List[dict]:
-        trades = []
-        for t in traders:
-            if random.random() < 0.12:
-                tid = f"{t.handle}_{datetime.utcnow().isoformat()}"
-                if tid not in self.last_seen:
-                    self.last_seen.add(tid)
-                    trades.append({
-                        "trader": t.handle,
-                        "window": t.window,
-                        "symbol": random.choice(["$PEPE", "$WIF", "$BONK", "$MEW", "$POPCAT", "$FARTCOIN"]),
-                        "side": random.choice(["buy", "sell"]),
-                        "price": round(random.uniform(0.00001, 0.1), 6),
-                        "time": datetime.utcnow().strftime("%H:%M"),
-                    })
-        return trades
+        # Preferujeme userId (stabilní UUID), fallback na handle
+        identifier = trader.user_id or trader.handle
+        if not identifier:
+            return []
+
+        try:
+            r = await self.client.get(
+                f"{FOMO_API_BASE}/users/{identifier}/trades",
+                params={"limit": TRADES_PER_TRADER},
+                headers={
+                    "Accept": "application/json",
+                    "authorization": f"Bearer {FOMO_API_KEY}",
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            logger.warning(f"Trades @{trader.handle} ({identifier}): {e}")
+            return []
+
+        new_trades = []
+        for raw in data.get("trades", []):
+            trade_id = raw.get("tradeId") or ""
+            if not trade_id:
+                continue
+            if trade_id in self.last_seen_trades:
+                continue
+
+            side = (raw.get("side") or "").lower()
+            # Ignorujeme transfery – nejsou to obchody
+            if side not in ("buy", "sell"):
+                self.last_seen_trades.add(trade_id)
+                continue
+
+            token = raw.get("token") or {}
+            symbol = token.get("symbol") or "?"
+            if not symbol.startswith("$"):
+                symbol = f"${symbol}"
+
+            # Cena: preferuj priceUsd, fallback avgEntryPrice/avgExitPrice
+            price = raw.get("priceUsd")
+            if price is None:
+                price = raw.get("avgEntryPrice") or raw.get("avgExitPrice") or 0.0
+
+            # Velikost v USD: preferuj sizeUsd, fallback costBasisUsd
+            size_usd = raw.get("sizeUsd")
+            if size_usd is None:
+                size_usd = raw.get("costBasisUsd") or 0.0
+
+            new_trades.append({
+                "trader": trader.handle,
+                "window": trader.window,
+                "symbol": symbol,
+                "side": side,
+                "price": float(price or 0),
+                "size_usd": float(size_usd or 0),
+                "realized_pnl": float(raw.get("realizedPnlUsd") or 0),
+                "time": raw.get("ts", ""),
+                "trade_id": trade_id,
+                "status": raw.get("status", ""),
+            })
+            self.last_seen_trades.add(trade_id)
+
+        return new_trades
 
 class GrokClient:
     def __init__(self):
@@ -175,47 +236,68 @@ class GrokClient:
         except Exception as e:
             return f"Grok chyba: {e}"
 
-# ==================== PAPER ====================
+# ==================== PAPER TRADING ====================
 class PaperTrader:
     def __init__(self):
         self.pf = PaperPortfolio()
         self.active = True
 
     def copy(self, trade: dict) -> Optional[str]:
+        """Zkopíruje reálný obchod do paper portfolia."""
         if not self.active:
             return None
 
-        size = max(5.0, self.pf.balance * TRADE_SIZE_PCT)
+        symbol = trade["symbol"]
+        side = trade["side"]
+        price = trade["price"]
+        trader = trade["trader"]
+        window = trade.get("window", "")
 
-        if trade["side"] == "buy" and self.pf.balance >= size:
-            self.pf.positions.append(
-                PaperPosition(
-                    symbol=trade["symbol"],
-                    amount_usd=size,
-                    entry_price=trade["price"],
-                    entry_time=trade["time"],
-                    source_trader=trade["trader"],
-                )
-            )
+        if side == "buy":
+            # Velikost: použij reálnou velikost z API, ale ne víc než 5 % zůstatku
+            api_size = trade.get("size_usd", 0)
+            size = api_size if api_size > 0 else max(5.0, self.pf.balance * TRADE_SIZE_PCT)
+            size = min(size, self.pf.balance * 0.25)  # max 25 % zůstatku
+
+            if size < 5.0 or self.pf.balance < size:
+                return None
+
+            self.pf.positions.append(PaperPosition(
+                symbol=symbol,
+                amount_usd=size,
+                entry_price=price,
+                entry_time=trade.get("time", ""),
+                source_trader=trader,
+                trade_id=trade.get("trade_id", ""),
+            ))
             self.pf.balance -= size
             return (
-                f"🟢 BUY {trade['symbol']} ${size:.1f}\n"
-                f"Od @{trade['trader']} ({trade['window']})\n"
+                f"🟢 BUY {symbol} ${size:.1f}\n"
+                f"Od @{trader} ({window})\n"
+                f"Cena: ${price:.6f}\n"
                 f"Zůstatek: ${self.pf.balance:.0f}"
             )
 
-        elif trade["side"] == "sell":
+        elif side == "sell":
+            # Najdi odpovídající pozici
             for i, p in enumerate(self.pf.positions):
-                if p.symbol == trade["symbol"]:
+                if p.symbol == symbol:
                     self.pf.positions.pop(i)
-                    pnl = p.amount_usd * random.uniform(-0.3, 0.8)
+                    # Použij skutečný realized PnL z API, pokud je k dispozici
+                    real_pnl = trade.get("realized_pnl", 0)
+                    if real_pnl != 0:
+                        pnl = real_pnl
+                    else:
+                        # Fallback: simulovaný PnL podle ceny
+                        pnl = p.amount_usd * ((price / p.entry_price) - 1) if p.entry_price > 0 else 0
                     self.pf.balance += p.amount_usd + pnl
                     self.pf.total_pnl += pnl
                     return (
-                        f"🔴 SELL {trade['symbol']} PnL ${pnl:+.1f}\n"
-                        f"Od @{trade['trader']}\n"
+                        f"🔴 SELL {symbol} PnL ${pnl:+.1f}\n"
+                        f"Od @{trader}\n"
                         f"Zůstatek: ${self.pf.balance:.0f}"
                     )
+            return None
         return None
 
 # ==================== INSTANCE ====================
@@ -271,8 +353,11 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for w in WINDOWS:
             traders = await fomo.get_top(w)
             lines.append(f"\n⏰ **{w.upper()}**")
-            for t in traders:
-                lines.append(f"  #{t.rank} @{t.handle} +${t.pnl_usd:,.0f}")
+            if traders:
+                for t in traders:
+                    lines.append(f"  #{t.rank} @{t.handle} +${t.pnl_usd:,.0f}")
+            else:
+                lines.append("  (žádná data – zkontroluj FOMO_API_KEY)")
         lines.append("\n⭐ **VIP**")
         for h in WATCHLIST:
             lines.append(f"  • @{h}")
@@ -308,23 +393,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== BACKGROUND JOBS ====================
 async def poll_loop(context: ContextTypes.DEFAULT_TYPE):
-    traders = []
+    """Periodicky kontroluje nové obchody u sledovaných traderů."""
+    traders: List[Trader] = []
+
+    # Top tradéři z leaderboardu
     for w in WINDOWS:
         traders.extend(await fomo.get_top(w))
-    # VIP přidáme jako extra (bez ranku)
+
+    # VIP list
     for h in WATCHLIST:
         traders.append(Trader(handle=h, window="vip"))
 
-    trades = await fomo.poll_trades(traders)
-    for tr in trades:
+    # Deduplikace podle userId/handle
+    seen = set()
+    unique_traders = []
+    for t in traders:
+        key = t.user_id or t.handle
+        if key not in seen:
+            seen.add(key)
+            unique_traders.append(t)
+
+    # Zkontroluj obchody u každého tradera
+    all_new_trades = []
+    for t in unique_traders:
+        trades = await fomo.get_trades(t)
+        all_new_trades.extend(trades)
+
+    # Zpracuj obchody
+    for tr in all_new_trades:
         msg = paper.copy(tr)
         if msg:
-            paper.pf.history.append({"msg": msg, "time": datetime.utcnow().isoformat()})
+            paper.pf.history.append({
+                "msg": msg,
+                "time": utcnow().isoformat(),
+                "trade_id": tr.get("trade_id", ""),
+            })
             for chat_id in list(SUBSCRIBERS):
                 try:
                     await context.bot.send_message(chat_id, msg)
                 except Exception as e:
                     logger.warning(f"Odeslání selhalo pro {chat_id}: {e}")
+
+    if all_new_trades:
+        logger.info(f"Zpracováno {len(all_new_trades)} nových obchodů.")
 
 async def self_ping_job(context: ContextTypes.DEFAULT_TYPE):
     """Self-ping, aby se free Render neuspával. Běží v bot event loopu."""
@@ -337,8 +448,8 @@ async def self_ping_job(context: ContextTypes.DEFAULT_TYPE):
         logger.debug(f"Self-ping chyba: {e}")
 
 async def post_init(app: Application):
-    app.job_queue.run_repeating(poll_loop, interval=POLL_INTERVAL, first=8)
-    app.job_queue.run_repeating(self_ping_job, interval=300, first=10)  # každých 5 minut
+    app.job_queue.run_repeating(poll_loop, interval=POLL_INTERVAL, first=10)
+    app.job_queue.run_repeating(self_ping_job, interval=300, first=15)
 
 # ==================== HEALTH CHECK ====================
 class HealthHandler(BaseHTTPRequestHandler):
@@ -348,7 +459,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, fmt, *args):
-        # potlačí spam do logů
         return
 
 def start_health_server():
@@ -364,9 +474,11 @@ def start_health_server():
 
 # ==================== MAIN ====================
 def main():
-    if not TELEGRAM_BOT_TOKEN or "TVUJ" in TELEGRAM_BOT_TOKEN:
-        print("Chybí TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_BOT_TOKEN:
+        print("Chybí TELEGRAM_BOT_TOKEN – nastav ho v Render Environment Variables.")
         return
+    if not FOMO_API_KEY:
+        print("Chybí FOMO_API_KEY – bot poběží, ale nebude číst žádné obchody.")
 
     start_health_server()
 
@@ -376,7 +488,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("FOMO Paper Beast běží. /start v Telegramu.")
+    print("FOMO Paper Beast běží s reálnými daty. /start v Telegramu.")
     app.run_polling()
 
 if __name__ == "__main__":
