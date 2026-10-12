@@ -7,15 +7,24 @@ FOMO Paper Beast — propracovaný paper copy bot
 """
 
 import os
-import asyncio
 import random
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, field, asdict
+
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
 # ==================== KONFIGURACE ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8746780290:AAH2qID7_zInu3J9AAe-uQLrhtMPMUUi-fc")
@@ -32,6 +41,9 @@ TRADE_SIZE_PCT = 0.05
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Chat IDs, které dostávají notifikace (naplní se při /start)
+SUBSCRIBERS: Set[int] = set()
 
 # ==================== DATOVÉ STRUKTURY ====================
 @dataclass
@@ -90,7 +102,7 @@ class FomoData:
                 Trader(
                     handle=t.get("handle", "?"),
                     user_id=t.get("userId") or "",
-                    rank=t.get("rank", i+1),
+                    rank=t.get("rank", i + 1),
                     window=window,
                     pnl_usd=float(t.get("pnlUsd") or 0),
                 )
@@ -101,8 +113,15 @@ class FomoData:
             return self._mock(window)
 
     def _mock(self, window: str) -> List[Trader]:
-        names = ["brezscales", "orangie", "tjr"] if window == "7d" else ["unipcs", "pointfarmcap", "frankdegods"]
-        return [Trader(handle=n, rank=i+1, window=window, pnl_usd=random.randint(50000, 400000)) for i, n in enumerate(names)]
+        names = (
+            ["brezscales", "orangie", "tjr"]
+            if window == "7d"
+            else ["unipcs", "pointfarmcap", "frankdegods"]
+        )
+        return [
+            Trader(handle=n, rank=i + 1, window=window, pnl_usd=random.randint(50000, 400000))
+            for i, n in enumerate(names)
+        ]
 
     async def poll_trades(self, traders: List[Trader]) -> List[dict]:
         trades = []
@@ -131,11 +150,20 @@ class GrokClient:
         try:
             r = await self.client.post(
                 "https://api.x.ai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {XAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
                 json={
                     "model": "grok-4",
                     "messages": [
-                        {"role": "system", "content": "Jsi Grok, asistent pro FOMO paper trading bot. Odpovídej česky, krátce, vtipně a užitečně. Kontext: " + context},
+                        {
+                            "role": "system",
+                            "content": (
+                                "Jsi Grok, asistent pro FOMO paper trading bot. "
+                                "Odpovídej česky, krátce, vtipně a užitečně. Kontext: " + context
+                            ),
+                        },
                         {"role": "user", "content": user_msg},
                     ],
                     "max_tokens": 300,
@@ -156,34 +184,59 @@ class PaperTrader:
     def copy(self, trade: dict) -> Optional[str]:
         if not self.active:
             return None
+
         size = max(5.0, self.pf.balance * TRADE_SIZE_PCT)
+
         if trade["side"] == "buy" and self.pf.balance >= size:
-            self.pf.positions.append(PaperPosition(
-                symbol=trade["symbol"], amount_usd=size, entry_price=trade["price"],
-                entry_time=trade["time"], source_trader=trade["trader"]
-            ))
+            self.pf.positions.append(
+                PaperPosition(
+                    symbol=trade["symbol"],
+                    amount_usd=size,
+                    entry_price=trade["price"],
+                    entry_time=trade["time"],
+                    source_trader=trade["trader"],
+                )
+            )
             self.pf.balance -= size
-            return f"🟢 BUY {trade['symbol']} ${size:.1f}\nOd @{trade['trader']} ({trade['window']})\nZůstatek: ${self.pf.balance:.0f}"
+            return (
+                f"🟢 BUY {trade['symbol']} ${size:.1f}\n"
+                f"Od @{trade['trader']} ({trade['window']})\n"
+                f"Zůstatek: ${self.pf.balance:.0f}"
+            )
+
         elif trade["side"] == "sell":
             for i, p in enumerate(self.pf.positions):
                 if p.symbol == trade["symbol"]:
                     self.pf.positions.pop(i)
-                    pnl = size * random.uniform(-0.3, 0.8)
-                    self.pf.balance += size + pnl
+                    pnl = p.amount_usd * random.uniform(-0.3, 0.8)
+                    self.pf.balance += p.amount_usd + pnl
                     self.pf.total_pnl += pnl
-                    return f"🔴 SELL {trade['symbol']} PnL ${pnl:+.1f}\nOd @{trade['trader']}\nZůstatek: ${self.pf.balance:.0f}"
+                    return (
+                        f"🔴 SELL {trade['symbol']} PnL ${pnl:+.1f}\n"
+                        f"Od @{trade['trader']}\n"
+                        f"Zůstatek: ${self.pf.balance:.0f}"
+                    )
         return None
 
-# ==================== TELEGRAM ====================
+# ==================== INSTANCE ====================
 fomo = FomoData()
 paper = PaperTrader()
+grok = GrokClient()
 
+# ==================== TELEGRAM HANDLERY ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    SUBSCRIBERS.add(update.effective_chat.id)
     kb = [
-        [InlineKeyboardButton("📊 Dashboard", callback_data="dash"),
-         InlineKeyboardButton("👥 Tracked", callback_data="tracked")],
-        [InlineKeyboardButton("⏸ Pause" if paper.active else "▶️ Resume", callback_data="toggle"),
-         InlineKeyboardButton("📜 Historie", callback_data="hist")],
+        [
+            InlineKeyboardButton("📊 Dashboard", callback_data="dash"),
+            InlineKeyboardButton("👥 Tracked", callback_data="tracked"),
+        ],
+        [
+            InlineKeyboardButton(
+                "⏸ Pause" if paper.active else "▶️ Resume", callback_data="toggle"
+            ),
+            InlineKeyboardButton("📜 Historie", callback_data="hist"),
+        ],
     ]
     await update.message.reply_text(
         "🔥 **FOMO Paper Beast** 🔥\n\n"
@@ -229,14 +282,31 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "▶️ Kopírování zapnuto" if paper.active else "⏸ Kopírování vypnuto"
     elif data == "hist":
         hist = paper.pf.history[-6:]
-        text = "📜 **Poslední**\n\n" + ("\n".join(h.get("msg", "") for h in hist) if hist else "Zatím nic")
+        text = "📜 **Poslední**\n\n" + (
+            "\n".join(h.get("msg", "") for h in hist) if hist else "Zatím nic"
+        )
     else:
         text = "Neznámé"
+
     await q.edit_message_text(text, parse_mode="Markdown")
+
+async def grok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Použití: `/grok <dotaz>`", parse_mode="Markdown")
+        return
+    q = " ".join(context.args)
+    ctx = (
+        f"Balance ${paper.pf.balance:.0f}, "
+        f"positions {len(paper.pf.positions)}, "
+        f"PnL ${paper.pf.total_pnl:+.0f}"
+    )
+    reply = await grok.chat(q, ctx)
+    await update.message.reply_text(reply)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Použij /start nebo tlačítka v menu.")
 
+# ==================== BACKGROUND JOBS ====================
 async def poll_loop(context: ContextTypes.DEFAULT_TYPE):
     traders = []
     for w in WINDOWS:
@@ -250,52 +320,62 @@ async def poll_loop(context: ContextTypes.DEFAULT_TYPE):
         msg = paper.copy(tr)
         if msg:
             paper.pf.history.append({"msg": msg, "time": datetime.utcnow().isoformat()})
-            # notifikace do posledního chatu (v produkci bys držel chat_id)
-            if context.job and hasattr(context.job, "chat_id") and context.job.chat_id:
-                await context.bot.send_message(context.job.chat_id, msg)
+            for chat_id in list(SUBSCRIBERS):
+                try:
+                    await context.bot.send_message(chat_id, msg)
+                except Exception as e:
+                    logger.warning(f"Odeslání selhalo pro {chat_id}: {e}")
+
+async def self_ping_job(context: ContextTypes.DEFAULT_TYPE):
+    """Self-ping, aby se free Render neuspával. Běží v bot event loopu."""
+    url = os.getenv("RENDER_EXTERNAL_URL", "https://fomo-paper-bot.onrender.com")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.get(url)
+            logger.info("Self-ping OK")
+    except Exception as e:
+        logger.debug(f"Self-ping chyba: {e}")
 
 async def post_init(app: Application):
     app.job_queue.run_repeating(poll_loop, interval=POLL_INTERVAL, first=8)
+    app.job_queue.run_repeating(self_ping_job, interval=300, first=10)  # každých 5 minut
 
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
+# ==================== HEALTH CHECK ====================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
 
+    def log_message(self, fmt, *args):
+        # potlačí spam do logů
+        return
+
 def start_health_server():
     port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    except OSError as e:
+        logger.error(f"Nepodařilo se spustit health server na portu {port}: {e}")
+        return
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     logger.info(f"Health check server běží na portu {port}")
 
-async def self_ping():
-    """Self-ping, aby se free Render neuspával."""
-    url = os.getenv("RENDER_EXTERNAL_URL", "https://fomo-paper-bot.onrender.com")
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.get(url)
-                logger.info("Self-ping OK")
-        except Exception as e:
-            logger.debug(f"Self-ping chyba: {e}")
-        await asyncio.sleep(300)  # každých 5 minut
-
+# ==================== MAIN ====================
 def main():
     if not TELEGRAM_BOT_TOKEN or "TVUJ" in TELEGRAM_BOT_TOKEN:
         print("Chybí TELEGRAM_BOT_TOKEN")
         return
+
     start_health_server()
-    # spustí self-ping na pozadí
-    asyncio.get_event_loop().create_task(self_ping())
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("grok", grok_cmd))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
     print("FOMO Paper Beast běží. /start v Telegramu.")
     app.run_polling()
 
