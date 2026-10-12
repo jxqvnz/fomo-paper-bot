@@ -257,10 +257,27 @@ async def poll_loop(context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     app.job_queue.run_repeating(poll_loop, interval=POLL_INTERVAL, first=8)
 
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def start_health_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Health check server běží na portu {port}")
+
 def main():
     if not TELEGRAM_BOT_TOKEN or "TVUJ" in TELEGRAM_BOT_TOKEN:
         print("Chybí TELEGRAM_BOT_TOKEN")
         return
+    start_health_server()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button))
