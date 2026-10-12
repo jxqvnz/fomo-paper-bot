@@ -1,10 +1,11 @@
 """
 FOMO Paper Beast — paper copy trading bot
 - Reálná data z FOMO API přes /v2/users/{id}/swaps
-- Žádná simulace
+- Žádná simulace, vše z reálného API
 """
 
 import os
+import asyncio
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -29,7 +30,10 @@ FOMO_API_KEY = os.getenv("FOMO_API_KEY", "")
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 FOMO_API_BASE = "https://api.fomoapi.io/v2"
 
-POLL_INTERVAL = 60
+# Zpomaleno na 5 minut, aby FOMO API nezahlcovalo 503
+POLL_INTERVAL = 300
+# Prodleva mezi requesty na jednotlivé tradery (aby se nestřílely naráz)
+DELAY_BETWEEN_TRADERS = 2.0
 TOP_N = 3
 WINDOWS = ["7d", "30d"]
 WATCHLIST = ["brezscales", "orangie", "tjr", "unipcs", "pointfarmcap"]
@@ -78,13 +82,11 @@ class PaperPortfolio:
 # ==================== FOMO API ====================
 class FomoData:
     def __init__(self):
-        self.client = httpx.AsyncClient(timeout=15.0)
+        self.client = httpx.AsyncClient(timeout=20.0)
         self.last_seen_swaps: Set[str] = set()
-        self._debug_logged = False
 
     async def get_top(self, window: str) -> List[Trader]:
         if not FOMO_API_KEY:
-            logger.warning("FOMO_API_KEY není nastaven.")
             return []
         try:
             r = await self.client.get(
@@ -111,15 +113,13 @@ class FomoData:
             logger.warning(f"Leaderboard {window}: {e}")
             return []
 
-    async def get_swaps(self, trader: Trader) -> List[dict]:
-        """Načte skutečné swapy z /v2/users/{id}/swaps."""
+    async def get_swaps_raw(self, identifier: str) -> Optional[dict]:
+        """
+        Vrátí raw JSON z /users/{id}/swaps nebo None při chybě.
+        Loguje status i tělo odpovědi.
+        """
         if not FOMO_API_KEY:
-            return []
-
-        identifier = trader.user_id or trader.handle
-        if not identifier:
-            return []
-
+            return None
         try:
             r = await self.client.get(
                 f"{FOMO_API_BASE}/users/{identifier}/swaps",
@@ -129,25 +129,28 @@ class FomoData:
                     "authorization": f"Bearer {FOMO_API_KEY}",
                 },
             )
-            if r.status_code == 503:
-                logger.warning(f"Swaps @{trader.handle}: 503 server busy – příště.")
-                return []
-            if r.status_code == 404:
-                logger.warning(f"Swaps @{trader.handle}: 404 – uživatel nenalezen.")
-                return []
-            r.raise_for_status()
-            data = r.json()
+            logger.info(
+                f"SWAPS @{identifier}: status={r.status_code} "
+                f"body={r.text[:1500]}"
+            )
+            if r.status_code != 200:
+                return None
+            return r.json()
         except Exception as e:
-            logger.warning(f"Swaps @{trader.handle} ({identifier}): {e}")
+            logger.warning(f"Swaps @{identifier} exception: {e}")
+            return None
+
+    async def get_swaps(self, trader: Trader) -> List[dict]:
+        """Načte swapy a převede na interní formát."""
+        identifier = trader.user_id or trader.handle
+        if not identifier:
             return []
 
-        # === DEBUG: jednorázový výpis RAW odpovědi ===
-        if not self._debug_logged:
-            logger.info(f"DEBUG swaps RAW pro @{trader.handle}: {str(data)[:2000]}")
-            self._debug_logged = True
-        # === konec DEBUG ===
+        data = await self.get_swaps_raw(identifier)
+        if data is None:
+            return []
 
-        # Zkus různé tvary odpovědi
+        # Různé možné tvary odpovědi
         if isinstance(data, list):
             swaps_list = data
         elif isinstance(data, dict):
@@ -171,60 +174,38 @@ class FomoData:
             if not isinstance(raw, dict):
                 continue
 
-            # ID swapu
             swap_id = (
-                raw.get("swapId")
-                or raw.get("id")
-                or raw.get("fillId")
-                or raw.get("txHash")
-                or raw.get("signature")
-                or ""
+                raw.get("swapId") or raw.get("id") or raw.get("fillId")
+                or raw.get("txHash") or raw.get("signature")
+                or f"{trader.handle}_{raw.get('ts') or raw.get('timestamp') or ''}"
             )
-            if not swap_id:
-                swap_id = f"{trader.handle}_{raw.get('ts') or raw.get('timestamp') or ''}"
             if swap_id in self.last_seen_swaps:
                 continue
 
-            # Strana
             side_raw = (
-                raw.get("side")
-                or raw.get("direction")
-                or raw.get("type")
-                or raw.get("action")
-                or ""
+                raw.get("side") or raw.get("direction")
+                or raw.get("type") or raw.get("action") or ""
             )
             side = str(side_raw).lower()
             if side not in ("buy", "sell"):
                 self.last_seen_swaps.add(swap_id)
                 continue
 
-            # Token
             token_raw = (
-                raw.get("token")
-                or raw.get("tokenSymbol")
-                or raw.get("symbol")
-                or raw.get("mint")
-                or "?"
+                raw.get("token") or raw.get("tokenSymbol")
+                or raw.get("symbol") or raw.get("mint") or "?"
             )
             token = str(token_raw)
             if not token.startswith("$"):
                 token = f"${token}"
 
-            # Cena
             price = (
-                raw.get("priceUsd")
-                or raw.get("price")
-                or raw.get("executionPrice")
-                or 0.0
+                raw.get("priceUsd") or raw.get("price")
+                or raw.get("executionPrice") or 0.0
             )
-
-            # Velikost USD
             amount = (
-                raw.get("amountUsd")
-                or raw.get("sizeUsd")
-                or raw.get("valueUsd")
-                or raw.get("value")
-                or 0.0
+                raw.get("amountUsd") or raw.get("sizeUsd")
+                or raw.get("valueUsd") or raw.get("value") or 0.0
             )
 
             new_swaps.append({
@@ -240,6 +221,7 @@ class FomoData:
             self.last_seen_swaps.add(swap_id)
 
         return new_swaps
+
 
 class GrokClient:
     def __init__(self):
@@ -328,11 +310,12 @@ class PaperTrader:
             return None
         return None
 
+# ==================== INSTANCE ====================
 fomo = FomoData()
 paper = PaperTrader()
 grok = GrokClient()
 
-# ==================== TELEGRAM ====================
+# ==================== TELEGRAM HANDLERY ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(update.effective_chat.id)
     kb = [
@@ -344,10 +327,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔥 **FOMO Paper Beast** 🔥\n\n"
         "Paper copy trading top traderů (7D + 30D)\n"
-        "VIP: brezscales, orangie a další\n\nVyber:",
+        "VIP: brezscales, orangie a další\n\n"
+        "Příkazy:\n"
+        "`/test <handle>` – zobrazí RAW swaps JSON z API\n"
+        "`/grok <dotaz>` – chat s Grok\n\n"
+        "Vyber:",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown",
     )
+
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Manuální test: /test <handle> — fetchne swaps a pošle RAW JSON do Telegramu.
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Použití: `/test brezscales`", parse_mode="Markdown"
+        )
+        return
+    handle = context.args[0].lstrip("@")
+    await update.message.reply_text(f"Testuji @{handle}…")
+    data = await fomo.get_swaps_raw(handle)
+    if data is None:
+        await update.message.reply_text(
+            f"❌ API nevrátilo 200 pro @{handle}. "
+            f"Podívej se do Render logu na řádek `SWAPS @{handle}`."
+        )
+        return
+    text = f"✅ @{handle} — RAW JSON:\n```\n{str(data)[:3500]}\n```"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -404,7 +412,7 @@ async def grok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Použij /start nebo tlačítka v menu.")
 
-# ==================== JOBS ====================
+# ==================== BACKGROUND JOBS ====================
 async def poll_loop(context: ContextTypes.DEFAULT_TYPE):
     traders: List[Trader] = []
     for w in WINDOWS:
@@ -424,6 +432,8 @@ async def poll_loop(context: ContextTypes.DEFAULT_TYPE):
     for t in unique_traders:
         swaps = await fomo.get_swaps(t)
         all_new_swaps.extend(swaps)
+        # Prodleva mezi requesty, aby FOMO nestřílel 503
+        await asyncio.sleep(DELAY_BETWEEN_TRADERS)
 
     if all_new_swaps:
         logger.info(f"Zpracováno {len(all_new_swaps)} nových swapů.")
@@ -433,7 +443,11 @@ async def poll_loop(context: ContextTypes.DEFAULT_TYPE):
     for sw in all_new_swaps:
         msg = paper.copy(sw)
         if msg:
-            paper.pf.history.append({"msg": msg, "time": utcnow().isoformat(), "swap_id": sw.get("swap_id", "")})
+            paper.pf.history.append({
+                "msg": msg,
+                "time": utcnow().isoformat(),
+                "swap_id": sw.get("swap_id", ""),
+            })
             for chat_id in list(SUBSCRIBERS):
                 try:
                     await context.bot.send_message(chat_id, msg)
@@ -441,6 +455,7 @@ async def poll_loop(context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Odeslání selhalo pro {chat_id}: {e}")
 
 async def self_ping_job(context: ContextTypes.DEFAULT_TYPE):
+    """Self-ping, aby se free Render neuspával."""
     url = os.getenv("RENDER_EXTERNAL_URL", "https://fomo-paper-bot.onrender.com")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -450,10 +465,10 @@ async def self_ping_job(context: ContextTypes.DEFAULT_TYPE):
         logger.debug(f"Self-ping chyba: {e}")
 
 async def post_init(app: Application):
-    app.job_queue.run_repeating(poll_loop, interval=POLL_INTERVAL, first=10)
-    app.job_queue.run_repeating(self_ping_job, interval=300, first=15)
+    app.job_queue.run_repeating(poll_loop, interval=POLL_INTERVAL, first=15)
+    app.job_queue.run_repeating(self_ping_job, interval=300, first=20)
 
-# ==================== HEALTH ====================
+# ==================== HEALTH CHECK ====================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -483,6 +498,7 @@ def main():
     start_health_server()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("test", test_cmd))
     app.add_handler(CommandHandler("grok", grok_cmd))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
