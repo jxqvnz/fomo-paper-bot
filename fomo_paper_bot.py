@@ -273,11 +273,25 @@ def start_health_server():
     thread.start()
     logger.info(f"Health check server běží na portu {port}")
 
+async def self_ping():
+    """Self-ping, aby se free Render neuspával."""
+    url = os.getenv("RENDER_EXTERNAL_URL", "https://fomo-paper-bot.onrender.com")
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.get(url)
+                logger.info("Self-ping OK")
+        except Exception as e:
+            logger.debug(f"Self-ping chyba: {e}")
+        await asyncio.sleep(300)  # každých 5 minut
+
 def main():
     if not TELEGRAM_BOT_TOKEN or "TVUJ" in TELEGRAM_BOT_TOKEN:
         print("Chybí TELEGRAM_BOT_TOKEN")
         return
     start_health_server()
+    # spustí self-ping na pozadí
+    asyncio.get_event_loop().create_task(self_ping())
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button))
